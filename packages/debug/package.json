@@ -15,6 +15,7 @@
     "@theia/output": "^0.10.0",
     "@theia/preferences": "^0.10.0",
     "@theia/process": "^0.10.0",
+    "@theia/task": "^0.10.0",
     "@theia/terminal": "^0.10.0",
     "@theia/userstorage": "^0.10.0",
     "@theia/variable-resolver": "^0.10.0",

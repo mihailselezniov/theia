@@ -16,22 +16,25 @@
 
 // tslint:disable:no-any
 
-import { injectable, inject, postConstruct } from 'inversify';
-import { Emitter, Event, DisposableCollection, MessageService, WaitUntilEvent, ProgressService } from '@theia/core';
+import { DisposableCollection, Emitter, Event, MessageService, ProgressService, WaitUntilEvent } from '@theia/core';
 import { LabelProvider } from '@theia/core/lib/browser';
-import { EditorManager } from '@theia/editor/lib/browser';
-import { ContextKeyService, ContextKey } from '@theia/core/lib/browser/context-key-service';
-import { DebugError, DebugService } from '../common/debug-service';
-import { DebugState, DebugSession } from './debug-session';
-import { DebugSessionFactory, DebugSessionContributionRegistry } from './debug-session-contribution';
-import { DebugThread } from './model/debug-thread';
-import { DebugStackFrame } from './model/debug-stack-frame';
-import { DebugBreakpoint } from './model/debug-breakpoint';
-import { BreakpointManager } from './breakpoint/breakpoint-manager';
+import { ContextKey, ContextKeyService } from '@theia/core/lib/browser/context-key-service';
 import URI from '@theia/core/lib/common/uri';
+import { EditorManager } from '@theia/editor/lib/browser';
+import { QuickOpenTask } from '@theia/task/lib/browser/quick-open-task';
+import { TaskService } from '@theia/task/lib/browser/task-service';
 import { VariableResolverService } from '@theia/variable-resolver/lib/browser';
-import { DebugSessionOptions, InternalDebugSessionOptions } from './debug-session-options';
+import { inject, injectable, postConstruct } from 'inversify';
 import { DebugConfiguration } from '../common/debug-common';
+import { DebugError, DebugService } from '../common/debug-service';
+import { BreakpointManager } from './breakpoint/breakpoint-manager';
+import { DebugConfigurationManager } from './debug-configuration-manager';
+import { DebugSession, DebugState } from './debug-session';
+import { DebugSessionContributionRegistry, DebugSessionFactory } from './debug-session-contribution';
+import { DebugSessionOptions, InternalDebugSessionOptions } from './debug-session-options';
+import { DebugBreakpoint } from './model/debug-breakpoint';
+import { DebugStackFrame } from './model/debug-stack-frame';
+import { DebugThread } from './model/debug-thread';
 
 export interface WillStartDebugSession extends WaitUntilEvent {
 }
@@ -127,6 +130,15 @@ export class DebugSessionManager {
     @inject(ContextKeyService)
     protected readonly contextKeyService: ContextKeyService;
 
+    @inject(TaskService)
+    protected readonly taskService: TaskService;
+
+    @inject(DebugConfigurationManager)
+    protected readonly debugConfigurationManager: DebugConfigurationManager;
+
+    @inject(QuickOpenTask)
+    protected readonly quickOpenTask: QuickOpenTask;
+
     protected debugTypeKey: ContextKey<string>;
     protected inDebugModeKey: ContextKey<boolean>;
 
@@ -142,23 +154,28 @@ export class DebugSessionManager {
     }
 
     async start(options: DebugSessionOptions): Promise<DebugSession | undefined> {
-        try {
-            return this.progressService.withProgress('Start...', 'debug', async () => {
-                await this.fireWillStartDebugSession();
+        return this.progressService.withProgress('Start...', 'debug', async () => {
+            try {
                 const resolved = await this.resolveConfiguration(options);
+                const taskRun = await this.runTaskAndCheckErrors(resolved.configuration.preLaunchTask);
+                if (!taskRun) {
+                    return undefined;
+                }
+
+                await this.fireWillStartDebugSession();
                 const sessionId = await this.debug.createDebugSession(resolved.configuration);
                 return this.doStart(sessionId, resolved);
-            });
-        } catch (e) {
-            if (DebugError.NotFound.is(e)) {
-                this.messageService.error(`The debug session type "${e.data.type}" is not supported.`);
-                return undefined;
-            }
+            } catch (e) {
+                if (DebugError.NotFound.is(e)) {
+                    this.messageService.error(`The debug session type "${e.data.type}" is not supported.`);
+                    return undefined;
+                }
 
-            this.messageService.error('There was an error starting the debug session, check the logs for more details.');
-            console.error('Error starting the debug session', e);
-            throw e;
-        }
+                this.messageService.error('There was an error starting the debug session, check the logs for more details.');
+                console.error('Error starting the debug session', e);
+                throw e;
+            }
+        });
     }
 
     protected async fireWillStartDebugSession(): Promise<void> {
@@ -214,12 +231,13 @@ export class DebugSessionManager {
             this.updateCurrentSession(session);
         });
         session.onDidChangeBreakpoints(uri => this.fireDidChangeBreakpoints({ session, uri }));
-        session.on('terminated', event => {
+        session.on('terminated', async event => {
             const restart = event.body && event.body.restart;
             if (restart) {
                 this.doRestart(session, restart);
             } else {
                 session.terminate();
+                await this.runTask(session.configuration.postDebugTask);
             }
         });
         session.on('exited', () => this.destroy(session.id));
@@ -374,4 +392,44 @@ export class DebugSessionManager {
         return origin && new DebugBreakpoint(origin, this.labelProvider, this.breakpoints, this.editorManager);
     }
 
+    /**
+     * Runs the given tasks
+     * @param taskLabel the task label to run
+     * @return true if it is possible to continue debugging otherwise it returns false
+     */
+    protected async runTaskAndCheckErrors(taskLabel: string | undefined): Promise<boolean> {
+        const runTask = await this.runTask(taskLabel);
+        if (runTask) {
+            return true;
+        }
+
+        const actions = ['Open launch.json', 'Cancel', 'Configure Task', 'Debug Anyway'];
+        const result = await this.messageService.error(`Could not run the task '${taskLabel}'`, ...actions);
+        switch (result) {
+            case actions[0]: // open launch.json
+                this.debugConfigurationManager.openConfiguration();
+                return false;
+            case actions[1]: // cancel
+                return false;
+            case actions[2]: // configure tasks
+                this.quickOpenTask.configure();
+                return false;
+            default: // continue debugging
+                return true;
+        }
+    }
+
+    protected async runTask(taskLabel: string | undefined): Promise<boolean> {
+        if (!taskLabel) {
+            return true;
+        }
+
+        const runTask = await this.taskService.runTaskByLabel(taskLabel);
+        if (!runTask) {
+            const errorMessage = `Could not run the task '${taskLabel}'`;
+            console.error(errorMessage);
+        }
+
+        return runTask;
+    }
 }
